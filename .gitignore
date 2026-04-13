@@ -1,0 +1,29 @@
+# Variáveis de ambiente
+.env
+
+# Arquivos Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Diretórios de saída temporários
+mp3/
+trascricao/
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Arquivos temporários
+*.tmp
+*.temp
