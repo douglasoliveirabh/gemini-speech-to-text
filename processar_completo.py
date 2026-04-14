@@ -14,10 +14,17 @@ load_dotenv()
 
 # Configurar a API do Gemini
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-pro')
+GEMINI_MODELS = os.getenv('GEMINI_MODELS', 'gemini-2.5-pro,gemini-2.0-flash,gemini-1.5-pro,gemini-1.5-flash').split(',')
+MAX_RETRIES = int(os.getenv('MAX_RETRIES', '10'))
+RETRY_DELAY = int(os.getenv('RETRY_DELAY', '5'))
+SEGMENT_DURATION_MINUTES = int(os.getenv('SEGMENT_DURATION_MINUTES', '15'))
+
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY não encontrada no arquivo .env")
 client = genai.Client(api_key=GEMINI_API_KEY)
+
+# Estatísticas dos modelos
+model_stats = {model: {'failures': 0, 'last_503': 0} for model in GEMINI_MODELS}
 
 def is_media_file(filename):
     video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.ogv']
@@ -32,10 +39,21 @@ def is_video_file(filename):
 def convert_to_mp3(video_file, output_file):
     cmd = [
         'ffmpeg', '-i', video_file, 
-        '-vn', '-acodec', 'mp3', '-ab', '128k', 
-        '-ar', '44100', '-y', output_file
+        '-vn',  # Sem vídeo
+        '-c:a', 'libmp3lame',  # Codec específico
+        '-b:a', '128k',  # Bitrate
+        '-ar', '44100',  # Sample rate
+        '-f', 'mp3',  # Forçar formato
+        '-avoid_negative_ts', 'make_zero',  # Lidar com timestamps
+        '-y', output_file
     ]
-    subprocess.run(cmd, check=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    
+    # Verificar se o arquivo foi criado corretamente
+    if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
+        raise Exception(f"Conversão falhou: arquivo não criado ou vazio")
+    
+    return result
 
 def get_audio_duration(audio_file):
     cmd = [
@@ -47,7 +65,7 @@ def get_audio_duration(audio_file):
 
 def split_audio(audio_file, output_dir):
     duration = get_audio_duration(audio_file)
-    segment_duration = 30 * 60  # 30 minutos em segundos
+    segment_duration = SEGMENT_DURATION_MINUTES * 60  # Configurável via .env
     
     base_name = Path(audio_file).stem
     segments = []
@@ -113,7 +131,7 @@ def process_media_files():
                 print("  Arquivo já é áudio, pulando conversão...")
                 audio_to_split = media_file
             
-            print("  Dividindo em segmentos de 30 minutos...")
+            print(f"  Dividindo em segmentos de {SEGMENT_DURATION_MINUTES} minutos...")
             segments = split_audio(audio_to_split, mp3_dir)
             
             if is_video_file(media_file):
@@ -130,19 +148,57 @@ def process_media_files():
     
     return True
 
+def is_retryable_error(error):
+    """Verifica se o erro é recuperável"""
+    error_str = str(error).lower()
+    if '503' in error_str or 'unavailable' in error_str or 'high demand' in error_str:
+        return True, 503
+    elif '429' in error_str or 'quota' in error_str or 'rate limit' in error_str:
+        return True, 429
+    return False, 0
+
+def get_best_model():
+    """Retorna o melhor modelo disponível"""
+    now = time.time()
+    
+    # Filtrar modelos que não tiveram 503 nos últimos 10 minutos
+    available_models = []
+    for model in GEMINI_MODELS:
+        last_503 = model_stats[model]['last_503']
+        if now - last_503 > 600:  # 10 minutos
+            available_models.append(model)
+    
+    if not available_models:
+        # Se todos estão indisponíveis, usar o menos problemático
+        available_models = [min(GEMINI_MODELS, key=lambda m: model_stats[m]['failures'])]
+    
+    return available_models[0]
+
 def upload_audio_file(file_path):
-    """Upload do arquivo de áudio para o Gemini"""
+    """Upload do arquivo de áudio para o Gemini com retry"""
     print(f"    Fazendo upload de {os.path.basename(file_path)}...")
     
-    upload_response = client.files.upload(
-        path=file_path,
-        config={'display_name': os.path.basename(file_path)}
-    )
-    
-    file_uri = upload_response.uri
-    time.sleep(5)  # Pequena pausa para garantir processamento
-    
-    return file_uri
+    for attempt in range(MAX_RETRIES):
+        try:
+            upload_response = client.files.upload(
+                path=file_path,
+                config={'display_name': os.path.basename(file_path)}
+            )
+            
+            file_uri = upload_response.uri
+            time.sleep(5)  # Pequena pausa para garantir processamento
+            return file_uri
+            
+        except Exception as e:
+            is_retryable, error_code = is_retryable_error(e)
+            print(f"    ⚠️ Upload tentativa {attempt + 1} falhou: {e}")
+            
+            if not is_retryable or attempt == MAX_RETRIES - 1:
+                raise e
+            
+            wait_time = RETRY_DELAY * (2 ** attempt)  # Backoff exponencial
+            print(f"    ⏳ Aguardando {wait_time}s...")
+            time.sleep(wait_time)
 
 def identify_personas(first_audio_file):
     """Identifica as personas no primeiro arquivo de áudio"""
@@ -173,31 +229,55 @@ Responda APENAS em formato JSON válido:
 Seja preciso e objetivo. Não adicione texto explicativo fora do JSON.
 """
     
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[
-                {'parts': [
-                    {'text': prompt},
-                    {'file_data': {'file_uri': file_uri}}
-                ]}
-            ]
-        )
-        
-        response_text = response.candidates[0].content.parts[0].text
-        
-        # Tentar extrair JSON da resposta
-        if '```json' in response_text:
-            json_text = response_text.split('```json')[1].split('```')[0].strip()
-        else:
-            json_text = response_text.strip()
-            
-        return json.loads(json_text)
-        
-    except Exception as e:
-        print(f"    ⚠️ Erro ao analisar personas: {e}")
-        # Fallback: criar personas genéricas
-        return {
+    # Tentar com múltiplos modelos
+    for model in GEMINI_MODELS:
+        for attempt in range(3):  # 3 tentativas por modelo
+            try:
+                print(f"    🤖 Tentando modelo: {model} (tentativa {attempt + 1})")
+                
+                response = client.models.generate_content(
+                    model=model,
+                    contents=[
+                        {'parts': [
+                            {'text': prompt},
+                            {'file_data': {'file_uri': file_uri}}
+                        ]}
+                    ]
+                )
+                
+                response_text = response.candidates[0].content.parts[0].text
+                
+                # Tentar extrair JSON da resposta
+                if '```json' in response_text:
+                    json_text = response_text.split('```json')[1].split('```')[0].strip()
+                else:
+                    json_text = response_text.strip()
+                
+                result = json.loads(json_text)
+                print(f"    ✅ Sucesso com modelo: {model}")
+                return result
+                
+            except Exception as e:
+                is_retryable, error_code = is_retryable_error(e)
+                print(f"    ❌ Modelo {model} tentativa {attempt + 1} falhou: {e}")
+                
+                if error_code == 503:
+                    model_stats[model]['last_503'] = time.time()
+                    model_stats[model]['failures'] += 1
+                    print(f"    🚫 Modelo {model} sobrecarregado - tentando próximo")
+                    break  # Pular para próximo modelo
+                
+                if not is_retryable:
+                    break  # Pular para próximo modelo
+                
+                if attempt < 2:
+                    wait_time = RETRY_DELAY * (attempt + 1)
+                    time.sleep(wait_time)
+    
+    # Se chegou aqui, todos os modelos falharam
+    print(f"    ⚠️ Todos os modelos falharam na identificação de personas")
+    # Fallback: criar personas genéricas
+    return {
             "personas": [
                 {
                     "id": "Pessoa1",
@@ -247,22 +327,69 @@ FORMATO DA RESPOSTA:
 Seja absolutamente fiel ao áudio. Transcreva tudo que for dito.
 """
     
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=[
-                {'parts': [
-                    {'text': prompt},
-                    {'file_data': {'file_uri': file_uri}}
-                ]}
-            ]
-        )
+    # Tentar com múltiplos modelos e estratégias
+    prompts = [
+        prompt,  # Prompt original detalhado
+        f"Transcreva este áudio identificando falantes como [Pessoa1], [Pessoa2].\n\nPERSONAS:\n{personas_list}\n\nTranscreva exatamente o que é falado.",
+        "Faça a transcrição completa deste áudio identificando diferentes falantes como [Pessoa1], [Pessoa2].",
+        "Transcreva este áudio completamente."
+    ]
+    
+    for strategy_idx, current_prompt in enumerate(prompts, 1):
+        print(f"    📝 Estratégia {strategy_idx}/{len(prompts)}")
         
-        return response.candidates[0].content.parts[0].text
+        for model in GEMINI_MODELS:
+            # Verificar se modelo está disponível
+            if time.time() - model_stats[model]['last_503'] < 600:  # 10 min cooldown
+                continue
+            
+            for attempt in range(3):  # 3 tentativas por modelo
+                try:
+                    print(f"      🤖 Modelo: {model} (tentativa {attempt + 1})")
+                    
+                    response = client.models.generate_content(
+                        model=model,
+                        contents=[
+                            {'parts': [
+                                {'text': current_prompt},
+                                {'file_data': {'file_uri': file_uri}}
+                            ]}
+                        ]
+                    )
+                    
+                    transcription = response.candidates[0].content.parts[0].text
+                    
+                    if len(transcription.strip()) < 10:
+                        raise Exception("Transcrição muito curta")
+                    
+                    print(f"      ✅ SUCESSO com {model}! ({len(transcription)} chars)")
+                    return transcription
+                    
+                except Exception as e:
+                    is_retryable, error_code = is_retryable_error(e)
+                    print(f"      ❌ {model} falhou: {e}")
+                    
+                    if error_code == 503:
+                        model_stats[model]['last_503'] = time.time()
+                        model_stats[model]['failures'] += 1
+                        print(f"      🚫 {model} sobrecarregado")
+                        break  # Próximo modelo
+                    
+                    if not is_retryable:
+                        break  # Próximo modelo
+                    
+                    if attempt < 2:
+                        wait_time = RETRY_DELAY * (attempt + 1)
+                        time.sleep(wait_time)
         
-    except Exception as e:
-        print(f"    ❌ Erro ao transcrever {audio_file}: {e}")
-        return f"[ERRO]: Falha na transcrição de {os.path.basename(audio_file)}"
+        # Pausa entre estratégias
+        if strategy_idx < len(prompts):
+            print(f"    🔄 Tentando próxima estratégia em 10s...")
+            time.sleep(10)
+    
+    # Se chegou aqui, tudo falhou
+    print(f"    💀 FALHA TOTAL após todas as estratégias para {os.path.basename(audio_file)}")
+    return f"[ERRO_CRÍTICO]: Falha total na transcrição de {os.path.basename(audio_file)} após {len(prompts)} estratégias e {len(GEMINI_MODELS)} modelos"
 
 def create_transcription_document(transcriptions, personas_info, output_path):
     """Cria um documento Word com todas as transcrições"""
