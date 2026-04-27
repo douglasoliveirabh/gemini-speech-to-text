@@ -8,8 +8,12 @@ __pycache__/
 *.so
 
 # Diretórios de saída temporários
+arquivo/
 mp3/
 trascricao/
+build/
+dist/
+build_artifacts/
 
 # Logs
 *.log
