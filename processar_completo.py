@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -23,7 +24,7 @@ DEFAULT_ENV_VALUES = {
     "BACKOFF_MAX": "300",
     "SEGMENT_DURATION_MINUTES": "15",
     "WHISPER_MODEL": "base",
-    "WHISPER_LANGUAGE": "",
+    "WHISPER_LANGUAGE": "pt",
     "GEMINI_MODELS": (
         "gemini-3.1-pro-preview,gemini-3.1-flash-lite-preview,gemini-2.5-pro,"
         "gemini-2.0-flash,gemini-1.5-pro,gemini-1.5-flash,gemini-1.5-flash-8b"
@@ -33,6 +34,9 @@ DEFAULT_ENV_VALUES = {
 VIDEO_EXTENSIONS = [".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".3gp", ".ogv"]
 AUDIO_EXTENSIONS = [".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"]
 ALL_EXTENSIONS = VIDEO_EXTENSIONS + AUDIO_EXTENSIONS
+EXTERNAL_BINARY_DIRNAME = "ffmpeg-bin"
+_EXTERNAL_BINARY_CACHE: dict[str, str] = {}
+_EXTERNAL_ENV_CONFIGURED = False
 
 
 class ProcessingCancelled(Exception):
@@ -379,8 +383,126 @@ def sleep_with_cancel(context: PipelineContext, seconds: int):
         time.sleep(min(0.5, deadline - time.time()))
 
 
+def prepend_env_path(env_name: str, directory: Path):
+    if not directory.exists():
+        return
+
+    current_entries = [entry for entry in os.getenv(env_name, "").split(os.pathsep) if entry]
+    directory_str = str(directory)
+    if directory_str in current_entries:
+        return
+
+    os.environ[env_name] = os.pathsep.join([directory_str, *current_entries]) if current_entries else directory_str
+
+
+def iter_external_binary_dirs() -> list[Path]:
+    candidates: list[Path] = []
+
+    if getattr(sys, "frozen", False):
+        executable_dir = Path(sys.executable).resolve().parent
+        candidates.extend(
+            [
+                executable_dir / EXTERNAL_BINARY_DIRNAME,
+                executable_dir,
+            ]
+        )
+
+        if sys.platform == "darwin":
+            contents_dir = executable_dir.parent
+            candidates.extend(
+                [
+                    contents_dir / "Frameworks" / EXTERNAL_BINARY_DIRNAME,
+                    contents_dir / "Resources" / EXTERNAL_BINARY_DIRNAME,
+                    contents_dir / "MacOS" / EXTERNAL_BINARY_DIRNAME,
+                ]
+            )
+
+        bundle_root = getattr(sys, "_MEIPASS", None)
+        if bundle_root:
+            bundle_dir = Path(bundle_root)
+            candidates.extend(
+                [
+                    bundle_dir / EXTERNAL_BINARY_DIRNAME,
+                    bundle_dir,
+                ]
+            )
+    else:
+        project_dir = get_project_dir()
+        candidates.extend(
+            [
+                project_dir / EXTERNAL_BINARY_DIRNAME,
+                project_dir / "bin",
+            ]
+        )
+
+    unique_candidates = []
+    seen = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_candidates.append(resolved)
+
+    return unique_candidates
+
+
+def configure_external_runtime_environment():
+    global _EXTERNAL_ENV_CONFIGURED
+
+    if _EXTERNAL_ENV_CONFIGURED:
+        return
+
+    for directory in iter_external_binary_dirs():
+        if not directory.exists():
+            continue
+
+        prepend_env_path("PATH", directory)
+
+        lib_dir = directory / "lib"
+        if not lib_dir.exists():
+            continue
+
+        if sys.platform == "darwin":
+            prepend_env_path("DYLD_LIBRARY_PATH", lib_dir)
+        elif not sys.platform.startswith("win"):
+            prepend_env_path("LD_LIBRARY_PATH", lib_dir)
+
+    _EXTERNAL_ENV_CONFIGURED = True
+
+
+def get_external_binary_filename(binary_name: str) -> str:
+    if sys.platform.startswith("win") and not binary_name.lower().endswith(".exe"):
+        return f"{binary_name}.exe"
+    return binary_name
+
+
+def resolve_external_binary(binary_name: str) -> Optional[str]:
+    cached = _EXTERNAL_BINARY_CACHE.get(binary_name)
+    if cached and Path(cached).exists():
+        return cached
+
+    configure_external_runtime_environment()
+
+    filename = get_external_binary_filename(binary_name)
+    for directory in iter_external_binary_dirs():
+        candidate = directory / filename
+        if candidate.exists():
+            _EXTERNAL_BINARY_CACHE[binary_name] = str(candidate)
+            prepend_env_path("PATH", candidate.parent)
+            return str(candidate)
+
+    resolved = shutil.which(binary_name) or shutil.which(filename)
+    if resolved:
+        _EXTERNAL_BINARY_CACHE[binary_name] = resolved
+        prepend_env_path("PATH", Path(resolved).parent)
+        return resolved
+
+    return None
+
+
 def ensure_external_dependencies():
-    missing = [binary for binary in ("ffmpeg", "ffprobe") if not shutil_which(binary)]
+    missing = [binary for binary in ("ffmpeg", "ffprobe") if not resolve_external_binary(binary)]
     if missing:
         raise FileNotFoundError(
             "Dependencias ausentes: " + ", ".join(missing) + ". Instale o FFmpeg e garanta que ele esteja no PATH."
@@ -406,25 +528,12 @@ def ensure_whisper_dependency():
 
 
 def shutil_which(binary_name: str) -> Optional[str]:
-    for directory in os.getenv("PATH", "").split(os.pathsep):
-        if not directory:
-            continue
-
-        candidate = Path(directory) / binary_name
-        if candidate.exists():
-            return str(candidate)
-
-        if sys.platform.startswith("win"):
-            candidate_exe = Path(directory) / f"{binary_name}.exe"
-            if candidate_exe.exists():
-                return str(candidate_exe)
-
-    return None
+    return resolve_external_binary(binary_name)
 
 
 def convert_to_mp3(video_file: str, output_file: str):
     cmd = [
-        "ffmpeg",
+        resolve_external_binary("ffmpeg") or "ffmpeg",
         "-i",
         video_file,
         "-vn",
@@ -451,7 +560,7 @@ def convert_to_mp3(video_file: str, output_file: str):
 
 def get_audio_duration(audio_file: str) -> float:
     cmd = [
-        "ffprobe",
+        resolve_external_binary("ffprobe") or "ffprobe",
         "-v",
         "quiet",
         "-show_entries",
@@ -480,7 +589,7 @@ def split_audio(audio_file: str, output_dir: str, segment_duration_minutes: int)
         output_file = os.path.join(output_dir, f"{base_name}-{segment_num:02d}.mp3")
 
         cmd = [
-            "ffmpeg",
+            resolve_external_binary("ffmpeg") or "ffmpeg",
             "-i",
             audio_file,
             "-ss",

@@ -224,6 +224,30 @@ Importante:
 - Windows gera instalador `.exe` se o Inno Setup estiver instalado; caso contrario, gera um `.zip` portatil
 - Linux gera um `.tar.gz` portatil
 
+### Como criar o instalador
+
+1. Entre na pasta do projeto
+2. Instale as dependencias de build
+3. Execute o script `build_installer.py`
+4. Abra a pasta `build_artifacts/` para pegar o arquivo gerado
+
+Exemplo no macOS / Linux:
+
+```bash
+cd /caminho/do/projeto
+python3 -m pip install pyinstaller google-genai python-docx openai-whisper
+brew install ffmpeg
+python3 build_installer.py
+```
+
+Exemplo no Windows:
+
+```bash
+cd C:\caminho\do\projeto
+py -m pip install pyinstaller google-genai python-docx openai-whisper
+py build_installer.py
+```
+
 ### 1. Instale as dependências de build
 
 macOS / Linux:
@@ -250,10 +274,12 @@ Sem o Inno Setup, o script ainda gera um `.zip` portatil.
 **macOS:**
 
 O script usa `hdiutil`, que ja vem no macOS, para gerar o `.dmg`.
+O FFmpeg precisa estar instalado na maquina de build para que `ffmpeg`, `ffprobe` e as bibliotecas dinamicas deles sejam incluidos dentro do `.app`.
 
 **Linux:**
 
 O script gera um `.tar.gz` com a pasta do aplicativo. Isso evita depender de um formato especifico de distribuicao.
+O FFmpeg precisa estar instalado na maquina de build para que os binarios sejam copiados para o pacote final.
 
 ### 3. Executar o build
 
@@ -269,6 +295,10 @@ Windows:
 py build_installer.py
 ```
 
+Opcao util:
+
+- `py build_installer.py --no-clean` ou `python3 build_installer.py --no-clean`: reaproveita a pasta `build_artifacts/` sem limpar tudo antes
+
 Os artefatos sao gerados em:
 
 ```bash
@@ -279,15 +309,29 @@ build_artifacts/
 
 **macOS:**
 - `build_artifacts/GeminiSpeechToText-macOS.dmg`
+- Resultado: imagem `.dmg` para distribuir ou instalar no proprio macOS
 
 **Windows com Inno Setup:**
 - `build_artifacts/windows-installer/GeminiSpeechToText-Windows-Installer.exe`
+- Resultado: instalador `.exe` tradicional com assistente de instalacao
 
 **Windows sem Inno Setup:**
 - `build_artifacts/GeminiSpeechToText-Windows-portable.zip`
+- Resultado: pacote portatil compactado, sem instalador
 
 **Linux:**
 - `build_artifacts/GeminiSpeechToText-Linux.tar.gz`
+- Resultado: pacote portatil compactado
+
+### Observacoes sobre o build
+
+- O instalador e gerado a partir da interface grafica `interface_desktop.py`
+- O build usa `PyInstaller` em todos os sistemas
+- Se `openai-whisper` estiver instalado no ambiente, ele tambem sera incluido no pacote
+- O build agora empacota `ffmpeg` e `ffprobe` junto com o executavel gerado
+- No macOS, o script tambem copia as bibliotecas dinamicas usadas pelo FFmpeg para o `.app`
+- No Windows, o `.exe` so e gerado se o compilador do Inno Setup (`ISCC.exe`) estiver disponivel
+- Execute o build no sistema de destino: macOS gera pacote de macOS, Windows gera pacote de Windows, Linux gera pacote de Linux
 
 ## 📁 Estrutura do Projeto
 
@@ -315,24 +359,74 @@ Quando o aplicativo e empacotado, os dados deixam de ficar dentro da pasta do pr
 
 ### Interface Desktop (Windows/macOS/Linux)
 
-1. Inicie a interface:
+### Executar em modo tela
+
+O modo tela e a execucao da interface grafica do projeto, em vez do processamento direto pelo terminal.
+
+1. Entre na pasta do projeto
+2. Execute a interface grafica:
+
 ```bash
+cd /caminho/do/projeto
 python3 interface_desktop.py
 ```
 
 No Windows:
 ```bash
+cd C:\caminho\do\projeto
 py interface_desktop.py
 ```
 
-2. Escolha o provedor: `Gemini API` ou `Whisper local`
-3. Se usar `Gemini API`, informe sua `GEMINI_API_KEY`
-4. Se usar `Whisper local`, escolha o modelo e opcionalmente o idioma
-5. Clique em **Salvar configuracoes**
-6. Clique em **Selecionar arquivos** e escolha um ou mais vídeos/áudios
-7. Clique em **Gerar transcrição**
-8. Acompanhe os logs na própria janela
-9. O arquivo final `.docx` será salvo em `trascricao/`
+Se voce estiver usando o aplicativo empacotado pelo `build_installer.py`, basta abrir o executavel gerado para o seu sistema. Nesse caso, nao e necessario rodar `interface_desktop.py` manualmente.
+
+Quando a interface abrir, o uso passa a ser todo pela tela: voce escolhe o provedor, adiciona os arquivos, acompanha os logs e abre a pasta das transcricoes pelos botoes da propria janela.
+
+### Como usar a tela
+
+Ao abrir a janela, a interface e dividida em 4 areas principais:
+
+- **Configuracao da transcricao**: escolha entre `Gemini API` e `Whisper local`
+- **Barra de acoes**: adiciona arquivos, atualiza a lista e abre as pastas do app
+- **Arquivos prontos para processar**: mostra a fila atual de videos e audios copiados para o app
+- **Logs do processamento**: exibe cada etapa da conversao, segmentacao e transcricao
+
+### Fluxo recomendado na interface
+
+1. Em **Provedor**, escolha `Gemini API` ou `Whisper local`
+2. Se escolher `Gemini API`, preencha `GEMINI_API_KEY`
+3. Se escolher `Whisper local`, selecione `WHISPER_MODEL` e, se quiser, informe `WHISPER_LANGUAGE`
+4. Clique em **Salvar configuracoes**
+5. Clique em **Selecionar arquivos** para escolher um ou mais videos/audios do computador
+6. Confira os arquivos na lista **Arquivos prontos para processar**
+7. Clique em **Gerar transcricao**
+8. Acompanhe o andamento em **Logs do processamento**
+9. Ao final, abra a pasta de saida pelo botao **Abrir transcricoes**
+
+### O que cada campo faz
+
+- `Gemini API`: usa a API do Google Gemini e tenta identificar diferentes falantes
+- `Whisper local`: roda a transcricao localmente, sem API externa
+- `GEMINI_API_KEY`: chave obrigatoria quando o provedor for Gemini
+- `WHISPER_MODEL`: define o tamanho do modelo local (`tiny`, `base`, `small`, `medium`, `large`, `turbo`)
+- `WHISPER_LANGUAGE`: pode ficar vazio para autodeteccao, ou receber valores como `pt`, `en` ou `es`
+
+### O que cada botao faz
+
+- **Selecionar arquivos**: copia os arquivos escolhidos para a pasta de entrada do aplicativo
+- **Atualizar lista**: recarrega manualmente a fila de arquivos exibida na tela
+- **Abrir pasta de entrada**: abre a pasta onde os arquivos aguardam processamento
+- **Abrir transcricoes**: abre a pasta onde os `.docx` finais sao gravados
+- **Abrir pasta do app**: abre a pasta base do aplicativo, onde tambem fica o `.env`
+- **Gerar transcricao**: inicia o pipeline completo com os arquivos listados
+
+### Comportamento importante da tela
+
+- Os arquivos selecionados sao **copiados** para a pasta do aplicativo; o arquivo original nao e movido
+- Nomes com acentos ou caracteres especiais podem ser normalizados automaticamente para evitar erros
+- Se ja existir um arquivo com o mesmo nome, a interface cria um nome unico
+- Durante o processamento, os campos e botoes de configuracao ficam desabilitados
+- Ao fechar a janela com uma transcricao em andamento, a interface pergunta se deve cancelar o processamento
+- O documento final e salvo como `.docx` na pasta `trascricao/` ou na pasta local do app empacotado
 
 Observações:
 - A interface usa o mesmo pipeline do script `processar_completo.py`
@@ -416,8 +510,9 @@ O sistema gera um documento Word (`.docx`) contendo:
 - Se aparecer `Numpy is not available`, reinstale uma versao compativel no mesmo ambiente: `python3 -m pip install "numpy<2" --force-reinstall`
 
 **Erro do FFmpeg:**
-- Certifique-se de que o FFmpeg está instalado e no PATH
-- Teste executando `ffmpeg -version` no terminal
+- Ao rodar pelo codigo-fonte, certifique-se de que o FFmpeg esta instalado e no PATH
+- Ao gerar um pacote distribuivel, instale o FFmpeg antes do `build_installer.py`
+- Teste executando `ffmpeg -version` e `ffprobe -version` no terminal da maquina de build
 
 **Erro de Tkinter no macOS:**
 - Se aparecer `No module named '_tkinter'`, instale `tcl-tk` e `python-tk@3.13`
