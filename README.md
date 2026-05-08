@@ -1,13 +1,14 @@
 # Sistema de Transcrição de Áudio/Vídeo
 
-Este projeto automatiza o processo de transcrição de arquivos de áudio e vídeo, utilizando a API do Google Gemini para identificar personas e transcrever conversas de forma fidedigna.
+Este projeto automatiza o processo de transcrição de arquivos de áudio e vídeo, permitindo usar a API do Google Gemini ou o Whisper local para gerar transcrições.
 
 ## 🚀 Funcionalidades
 
 - **Processamento automático**: Converte vídeos para áudio e divide em segmentos configuráveis
-- **Identificação de personas**: Reconhece automaticamente diferentes falantes
-- **Transcrição fidedigna**: Transcreve exatamente o que é falado, mantendo hesitações e pausas
-- **Documento formatado**: Gera um documento Word com transcrições organizadas por persona
+- **Dois modos de transcrição**: Gemini API ou Whisper local
+- **Identificação de personas**: Disponível no modo Gemini
+- **Transcrição local**: Whisper roda sem depender da API do Gemini
+- **Documento formatado**: Gera um documento Word com o resultado final
 - **Limpeza automática**: Remove arquivos temporários após o processamento
 - **Interface desktop**: Tela nativa em Python para Windows, macOS e Linux
 
@@ -15,7 +16,7 @@ Este projeto automatiza o processo de transcrição de arquivos de áudio e víd
 
 - Python 3.9+
 - FFmpeg (para processamento de áudio/vídeo)
-- Chave da API do Google Gemini
+- Chave da API do Google Gemini para o modo Gemini
 
 ### Instalação do FFmpeg
 
@@ -43,7 +44,7 @@ cd trascricao-quebra-video-trascricao
 
 2. Instale as dependências Python:
 ```bash
-python3 -m pip install google-genai python-docx
+python3 -m pip install google-genai python-docx openai-whisper
 ```
 
 3. Configure a chave da API:
@@ -51,9 +52,12 @@ python3 -m pip install google-genai python-docx
 cp .env.example .env
 ```
 
-4. Edite o arquivo `.env` e adicione sua chave da API do Google Gemini:
-```
+4. Edite o arquivo `.env` de acordo com o modo desejado:
+```env
+TRANSCRIPTION_PROVIDER=gemini
 GEMINI_API_KEY=sua_chave_api_gemini_aqui
+WHISPER_MODEL=base
+WHISPER_LANGUAGE=
 ```
 
 ## 🖥️ Instalação da Interface Desktop
@@ -65,7 +69,7 @@ A interface gráfica foi feita com `tkinter` e usa o mesmo pipeline Python do pr
 Instale os pacotes do projeto:
 
 ```bash
-python3 -m pip install google-genai python-docx
+python3 -m pip install google-genai python-docx openai-whisper
 ```
 
 **Windows (PowerShell ou Prompt de Comando):**
@@ -73,8 +77,12 @@ python3 -m pip install google-genai python-docx
 Se o comando acima não funcionar, use o launcher do Python:
 
 ```bash
-py -m pip install google-genai python-docx
+py -m pip install google-genai python-docx openai-whisper
 ```
+
+Observações:
+- `openai-whisper` so e usado quando o provedor selecionado for `Whisper local`
+- Na primeira execucao do Whisper, o modelo escolhido sera baixado automaticamente
 
 ### 2. FFmpeg
 
@@ -175,13 +183,22 @@ Crie o arquivo de configuração:
 cp .env.example .env
 ```
 
-Edite o `.env` e adicione sua chave:
+Edite o `.env` com o modo desejado:
 
 ```env
+TRANSCRIPTION_PROVIDER=gemini
 GEMINI_API_KEY=sua_chave_api_gemini_aqui
+WHISPER_MODEL=base
+WHISPER_LANGUAGE=
 ```
 
-Tambem e possivel configurar a chave diretamente pela interface, usando o campo `GEMINI_API_KEY` e o botao `Salvar no .env`.
+Opcoes:
+- `TRANSCRIPTION_PROVIDER=gemini` usa a API do Gemini
+- `TRANSCRIPTION_PROVIDER=whisper_local` usa Whisper local
+- `WHISPER_MODEL` pode ser `tiny`, `base`, `small`, `medium`, `large` ou `turbo`
+- `WHISPER_LANGUAGE` pode ficar vazio para deteccao automatica ou receber algo como `pt`, `en`, `es` ou `pt-BR` (normalizado para `pt`)
+
+Tambem e possivel configurar tudo diretamente pela interface.
 
 ### 5. Executar a interface
 
@@ -212,13 +229,13 @@ Importante:
 macOS / Linux:
 
 ```bash
-python3 -m pip install pyinstaller google-genai python-docx
+python3 -m pip install pyinstaller google-genai python-docx openai-whisper
 ```
 
 Windows:
 
 ```bash
-py -m pip install pyinstaller google-genai python-docx
+py -m pip install pyinstaller google-genai python-docx openai-whisper
 ```
 
 ### 2. Dependências opcionais por sistema
@@ -308,17 +325,20 @@ No Windows:
 py interface_desktop.py
 ```
 
-2. Informe sua `GEMINI_API_KEY`
-3. Clique em **Salvar no .env**
-4. Clique em **Selecionar arquivos** e escolha um ou mais vídeos/áudios
-5. Clique em **Gerar transcrição**
-6. Acompanhe os logs na própria janela
-7. O arquivo final `.docx` será salvo em `trascricao/`
+2. Escolha o provedor: `Gemini API` ou `Whisper local`
+3. Se usar `Gemini API`, informe sua `GEMINI_API_KEY`
+4. Se usar `Whisper local`, escolha o modelo e opcionalmente o idioma
+5. Clique em **Salvar configuracoes**
+6. Clique em **Selecionar arquivos** e escolha um ou mais vídeos/áudios
+7. Clique em **Gerar transcrição**
+8. Acompanhe os logs na própria janela
+9. O arquivo final `.docx` será salvo em `trascricao/`
 
 Observações:
 - A interface usa o mesmo pipeline do script `processar_completo.py`
 - Ao rodar empacotado, os arquivos ficam na pasta local do aplicativo, nao na pasta do projeto
 - O FFmpeg continua sendo obrigatório
+- O modo Whisper local nao identifica automaticamente diferentes falantes neste fluxo atual
 
 ### Pipeline Completo (Recomendado)
 
@@ -360,7 +380,7 @@ python3 transcrever_audios.py
 
 ## 🎭 Identificação de Personas
 
-O sistema analisa automaticamente o primeiro segmento de áudio para:
+No modo Gemini, o sistema analisa automaticamente o primeiro segmento de áudio para:
 - Identificar quantas pessoas falam
 - Caracterizar cada voz (tom, velocidade, etc.)
 - Determinar o papel de cada pessoa na conversa
@@ -368,16 +388,18 @@ O sistema analisa automaticamente o primeiro segmento de áudio para:
 ## 📄 Saída
 
 O sistema gera um documento Word (`.docx`) contendo:
-- Lista de personas identificadas
+- Lista de personas identificadas no modo Gemini
 - Transcrição completa dividida por segmentos
-- Identificação de quem fala em cada momento
+- Identificação de quem fala em cada momento no modo Gemini
+- Timestamps por trecho no modo Whisper local
 - Formatação clara e organizizada
 - O arquivo final é salvo na pasta `trascricao/`
 
 ## ⚠️ Limitações
 
 - Arquivos são divididos conforme `SEGMENT_DURATION_MINUTES` no `.env` (padrão: 15 minutos)
-- Requer conexão com internet para usar a API do Gemini
+- O modo Gemini requer conexão com internet e quota disponível na API
+- O modo Whisper local pode ser mais lento e baixa o modelo na primeira execução
 - Qualidade da identificação de personas depende da clareza do áudio
 - Suporte limitado a idiomas (principalmente português)
 
@@ -386,6 +408,12 @@ O sistema gera um documento Word (`.docx`) contendo:
 **Erro de API:**
 - Verifique se sua chave do Gemini está correta no arquivo `.env`
 - Confirme se você tem créditos disponíveis na API
+
+**Erro do Whisper local:**
+- Verifique se `openai-whisper` foi instalado no mesmo ambiente Python da interface
+- Na primeira execucao, aguarde o download do modelo
+- Se o processamento local estiver muito lento, troque `WHISPER_MODEL` para `tiny` ou `base`
+- Se aparecer `Numpy is not available`, reinstale uma versao compativel no mesmo ambiente: `python3 -m pip install "numpy<2" --force-reinstall`
 
 **Erro do FFmpeg:**
 - Certifique-se de que o FFmpeg está instalado e no PATH

@@ -5,19 +5,25 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 APP_NAME = "GeminiSpeechToText"
+TRANSCRIPTION_PROVIDERS = ("gemini", "whisper_local")
+WHISPER_MODELS = ("tiny", "base", "small", "medium", "large", "turbo")
 DEFAULT_ENV_VALUES = {
+    "TRANSCRIPTION_PROVIDER": "gemini",
     "GEMINI_API_KEY": "",
     "GEMINI_MODEL": "gemini-2.5-pro",
     "MAX_RETRIES": "15",
     "RETRY_DELAY": "5",
     "BACKOFF_MAX": "300",
     "SEGMENT_DURATION_MINUTES": "15",
+    "WHISPER_MODEL": "base",
+    "WHISPER_LANGUAGE": "",
     "GEMINI_MODELS": (
         "gemini-3.1-pro-preview,gemini-3.1-flash-lite-preview,gemini-2.5-pro,"
         "gemini-2.0-flash,gemini-1.5-pro,gemini-1.5-flash,gemini-1.5-flash-8b"
@@ -48,12 +54,15 @@ class RuntimePaths:
 
 @dataclass
 class PipelineSettings:
+    transcription_provider: str
     api_key: str
     models: list[str]
     max_retries: int
     retry_delay: int
     backoff_max: int
     segment_duration_minutes: int
+    whisper_model: str
+    whisper_language: str
 
 
 class PipelineContext:
@@ -63,7 +72,7 @@ class PipelineContext:
         stop_event=None,
         paths: Optional[RuntimePaths] = None,
         settings: Optional[PipelineSettings] = None,
-        require_api_key: bool = True,
+        require_api_key: Optional[bool] = None,
     ):
         self.logger = logger or print
         self.stop_event = stop_event
@@ -71,6 +80,10 @@ class PipelineContext:
         self.settings = settings or load_settings(self.paths.env_file)
         self.client = None
         self.model_stats = {}
+        self.whisper_model_instance = None
+
+        if require_api_key is None:
+            require_api_key = uses_gemini(self.settings)
 
         if require_api_key:
             if not has_configured_api_key(self.settings.api_key):
@@ -145,9 +158,12 @@ def ensure_runtime_dirs(paths: RuntimePaths) -> RuntimePaths:
 def render_env_template() -> str:
     return "\n".join(
         [
-            "# Configuracao da API do Google Gemini",
+            "# Configuracao do provedor de transcricao",
+            f"TRANSCRIPTION_PROVIDER={DEFAULT_ENV_VALUES['TRANSCRIPTION_PROVIDER']}",
             f"GEMINI_API_KEY={DEFAULT_ENV_VALUES['GEMINI_API_KEY']}",
             f"GEMINI_MODEL={DEFAULT_ENV_VALUES['GEMINI_MODEL']}",
+            f"WHISPER_MODEL={DEFAULT_ENV_VALUES['WHISPER_MODEL']}",
+            f"WHISPER_LANGUAGE={DEFAULT_ENV_VALUES['WHISPER_LANGUAGE']}",
             "# Configuracoes de resiliencia",
             f"MAX_RETRIES={DEFAULT_ENV_VALUES['MAX_RETRIES']}",
             f"RETRY_DELAY={DEFAULT_ENV_VALUES['RETRY_DELAY']}",
@@ -179,6 +195,13 @@ def ensure_env_file(env_path: Optional[Path] = None) -> Path:
 def save_api_key(api_key: str, env_path: Optional[Path] = None) -> Path:
     target = ensure_env_file(env_path)
     update_env_file_value(target, "GEMINI_API_KEY", api_key.strip())
+    return target
+
+
+def save_settings(values: dict[str, str], env_path: Optional[Path] = None) -> Path:
+    target = ensure_env_file(env_path)
+    for key, value in values.items():
+        update_env_file_value(target, key, str(value).strip())
     return target
 
 
@@ -245,16 +268,59 @@ def update_env_file_value(env_path: Path, key: str, value: str):
 
 def load_settings(env_path: Optional[Path] = None) -> PipelineSettings:
     values = read_env_values(env_path)
+    provider = values["TRANSCRIPTION_PROVIDER"].strip().lower() or DEFAULT_ENV_VALUES["TRANSCRIPTION_PROVIDER"]
+    if provider not in TRANSCRIPTION_PROVIDERS:
+        provider = DEFAULT_ENV_VALUES["TRANSCRIPTION_PROVIDER"]
+
     models = [model.strip() for model in values["GEMINI_MODELS"].split(",") if model.strip()]
+    whisper_model = values["WHISPER_MODEL"].strip() or DEFAULT_ENV_VALUES["WHISPER_MODEL"]
+    if whisper_model not in WHISPER_MODELS:
+        whisper_model = DEFAULT_ENV_VALUES["WHISPER_MODEL"]
+    whisper_language = normalize_whisper_language(values["WHISPER_LANGUAGE"])
 
     return PipelineSettings(
+        transcription_provider=provider,
         api_key=values["GEMINI_API_KEY"].strip(),
         models=models,
         max_retries=int(values["MAX_RETRIES"]),
         retry_delay=int(values["RETRY_DELAY"]),
         backoff_max=int(values["BACKOFF_MAX"]),
         segment_duration_minutes=int(values["SEGMENT_DURATION_MINUTES"]),
+        whisper_model=whisper_model,
+        whisper_language=whisper_language,
     )
+
+
+def normalize_whisper_language(language: str) -> str:
+    cleaned = (language or "").strip().lower().replace("_", "-")
+    if not cleaned:
+        return ""
+
+    try:
+        from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE
+    except Exception:
+        return cleaned.split("-", 1)[0]
+
+    if cleaned in LANGUAGES:
+        return cleaned
+    if cleaned in TO_LANGUAGE_CODE:
+        return TO_LANGUAGE_CODE[cleaned]
+
+    base_language = cleaned.split("-", 1)[0]
+    if base_language in LANGUAGES:
+        return base_language
+    if base_language in TO_LANGUAGE_CODE:
+        return TO_LANGUAGE_CODE[base_language]
+
+    return cleaned
+
+
+def uses_gemini(settings: PipelineSettings) -> bool:
+    return settings.transcription_provider == "gemini"
+
+
+def uses_whisper(settings: PipelineSettings) -> bool:
+    return settings.transcription_provider == "whisper_local"
 
 
 def has_configured_api_key(api_key: str) -> bool:
@@ -319,6 +385,24 @@ def ensure_external_dependencies():
         raise FileNotFoundError(
             "Dependencias ausentes: " + ", ".join(missing) + ". Instale o FFmpeg e garanta que ele esteja no PATH."
         )
+
+
+def ensure_whisper_dependency():
+    try:
+        import whisper  # noqa: F401
+    except ModuleNotFoundError as error:
+        raise ModuleNotFoundError(
+            "Dependencia ausente: openai-whisper. Instale com 'python3 -m pip install openai-whisper'."
+        ) from error
+    except Exception as error:
+        message = str(error)
+        if "Numpy is not available" in message or "_ARRAY_API not found" in message:
+            raise RuntimeError(
+                "Ambiente Whisper incompatível: o PyTorch instalado nao funciona com a versao atual do NumPy. "
+                "No mesmo ambiente da interface, execute: "
+                "\"python3 -m pip install 'numpy<2' --force-reinstall\"."
+            ) from error
+        raise
 
 
 def shutil_which(binary_name: str) -> Optional[str]:
@@ -512,6 +596,37 @@ def build_quota_help_message(model: str) -> str:
         "A chave atual nao tem limite utilizavel nesse modelo ou a cota diaria do projeto esta zerada. "
         "Troque para outra API key/projeto com billing e quota ativa, ou ajuste GEMINI_MODELS para usar apenas modelos com cota disponivel."
     )
+
+
+def format_timestamp(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def get_whisper_model(context: PipelineContext):
+    if context.whisper_model_instance is not None:
+        return context.whisper_model_instance
+
+    ensure_whisper_dependency()
+
+    try:
+        import whisper
+    except ModuleNotFoundError as error:
+        raise ModuleNotFoundError(
+            "Dependencia ausente: openai-whisper. Instale com 'python3 -m pip install openai-whisper'."
+        ) from error
+
+    context.log(f"Carregando modelo Whisper local: {context.settings.whisper_model}")
+    try:
+        context.whisper_model_instance = whisper.load_model(context.settings.whisper_model)
+    except urllib.error.URLError as error:
+        raise RuntimeError(
+            "Nao foi possivel baixar o modelo Whisper. Verifique sua conexao com a internet "
+            "e tente novamente."
+        ) from error
+    return context.whisper_model_instance
 
 
 def upload_audio_file(file_path: str, context: PipelineContext) -> str:
@@ -723,6 +838,51 @@ FORMATO:
     )
 
 
+def transcribe_audio_with_whisper(audio_file: str, context: PipelineContext) -> str:
+    context.log(f"    Transcrevendo localmente com Whisper: {os.path.basename(audio_file)}...")
+    model = get_whisper_model(context)
+
+    options = {
+        "task": "transcribe",
+        "verbose": False,
+        "fp16": False,
+    }
+    if context.settings.whisper_language:
+        options["language"] = context.settings.whisper_language
+
+    try:
+        result = model.transcribe(audio_file, **options)
+    except ValueError as error:
+        message = str(error)
+        if "Unsupported language:" in message:
+            raise RuntimeError(
+                "Idioma Whisper invalido. Use autodeteccao deixando o campo vazio, "
+                "ou informe um codigo como `pt`, `en`, `es`. Variantes como `pt-BR` "
+                "sao convertidas automaticamente para `pt`."
+            ) from error
+        raise
+    detected_language = result.get("language")
+    if detected_language:
+        context.log(f"      Idioma detectado: {detected_language}")
+
+    segments = result.get("segments") or []
+    if not segments:
+        text = (result.get("text") or "").strip()
+        return text or "[SEM_TEXTO]: O Whisper nao retornou conteudo para este trecho."
+
+    lines = []
+    for segment in segments:
+        segment_text = (segment.get("text") or "").strip()
+        if not segment_text:
+            continue
+
+        start = format_timestamp(segment.get("start", 0))
+        end = format_timestamp(segment.get("end", 0))
+        lines.append(f"[{start} - {end}] {segment_text}")
+
+    return "\n".join(lines)
+
+
 def create_transcription_document(
     transcriptions: list[tuple[str, str]],
     personas_info: dict,
@@ -780,6 +940,50 @@ def create_transcription_document(
     context.log(f"  OK - Documento salvo em: {output_path}")
 
 
+def create_whisper_transcription_document(
+    transcriptions: list[tuple[str, str]],
+    output_path: Path,
+    context: PipelineContext,
+):
+    context.log("  Criando documento Word com transcricoes locais do Whisper...")
+    try:
+        from docx import Document
+    except ModuleNotFoundError as error:
+        raise ModuleNotFoundError(
+            "Dependencia ausente: python-docx. Instale com 'python3 -m pip install python-docx'."
+        ) from error
+
+    document = Document()
+    document.add_heading("Transcricao Completa do Audio", 0)
+
+    summary = document.add_paragraph()
+    summary.add_run("Motor de transcricao: ").bold = True
+    summary.add_run("Whisper local")
+
+    model_line = document.add_paragraph()
+    model_line.add_run("Modelo Whisper: ").bold = True
+    model_line.add_run(context.settings.whisper_model)
+
+    language_line = document.add_paragraph()
+    language_line.add_run("Idioma configurado: ").bold = True
+    language_line.add_run(context.settings.whisper_language or "auto")
+
+    document.add_page_break()
+
+    for index, (filename, transcription) in enumerate(transcriptions, 1):
+        document.add_heading(f"Segmento {index:02d} - {filename}", level=1)
+
+        for line in transcription.strip().split("\n"):
+            if line.strip():
+                document.add_paragraph(line)
+
+        if index < len(transcriptions):
+            document.add_paragraph("-" * 50)
+
+    document.save(output_path)
+    context.log(f"  OK - Documento salvo em: {output_path}")
+
+
 def transcribe_audio_segments(context: PipelineContext) -> Path:
     context.log("ETAPA 2: Transcrevendo arquivos de audio...")
 
@@ -790,24 +994,36 @@ def transcribe_audio_segments(context: PipelineContext) -> Path:
         )
 
     context.log(f"  Encontrados {len(mp3_files)} arquivos de audio para transcrever")
-    first_file = str(mp3_files[0])
-    personas_info = identify_personas(first_file, context)
-
-    context.log("  Personas identificadas:")
-    for persona in personas_info["personas"]:
-        context.log(f"    - {persona['id']}: {persona['nome']}")
-
-    transcriptions = []
-    for index, mp3_file in enumerate(mp3_files, 1):
-        context.check_cancelled()
-        context.log(f"  Processando arquivo {index}/{len(mp3_files)}")
-        transcription = transcribe_audio_with_personas(str(mp3_file), personas_info, context)
-        transcriptions.append((mp3_file.name, transcription))
-        sleep_with_cancel(context, 3)
-
     base_name = mp3_files[0].stem.replace("-01", "")
-    output_path = context.paths.output_dir / f"{base_name}_transcricao_completa.docx"
-    create_transcription_document(transcriptions, personas_info, output_path, context)
+
+    if uses_whisper(context.settings):
+        transcriptions = []
+        for index, mp3_file in enumerate(mp3_files, 1):
+            context.check_cancelled()
+            context.log(f"  Processando arquivo {index}/{len(mp3_files)}")
+            transcription = transcribe_audio_with_whisper(str(mp3_file), context)
+            transcriptions.append((mp3_file.name, transcription))
+
+        output_path = context.paths.output_dir / f"{base_name}_transcricao_whisper.docx"
+        create_whisper_transcription_document(transcriptions, output_path, context)
+    else:
+        first_file = str(mp3_files[0])
+        personas_info = identify_personas(first_file, context)
+
+        context.log("  Personas identificadas:")
+        for persona in personas_info["personas"]:
+            context.log(f"    - {persona['id']}: {persona['nome']}")
+
+        transcriptions = []
+        for index, mp3_file in enumerate(mp3_files, 1):
+            context.check_cancelled()
+            context.log(f"  Processando arquivo {index}/{len(mp3_files)}")
+            transcription = transcribe_audio_with_personas(str(mp3_file), personas_info, context)
+            transcriptions.append((mp3_file.name, transcription))
+            sleep_with_cancel(context, 3)
+
+        output_path = context.paths.output_dir / f"{base_name}_transcricao_completa.docx"
+        create_transcription_document(transcriptions, personas_info, output_path, context)
 
     context.log("Removendo arquivos MP3 temporarios...")
     for mp3_file in mp3_files:
@@ -833,9 +1049,12 @@ def run_pipeline(
 ) -> Path:
     ensure_external_dependencies()
     context = PipelineContext(logger=logger, stop_event=stop_event, paths=paths)
+    if uses_whisper(context.settings):
+        ensure_whisper_dependency()
 
     context.log("INICIANDO PROCESSAMENTO COMPLETO")
     context.log("=" * 50)
+    context.log(f"Provedor selecionado: {context.settings.transcription_provider}")
 
     process_media_files(context)
     context.log("Processamento de midia concluido.")

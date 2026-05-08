@@ -13,13 +13,15 @@ from tkinter import filedialog, messagebox, ttk
 from processar_completo import (
     APP_NAME,
     ProcessingCancelled,
+    WHISPER_MODELS,
     generate_unique_path,
     get_runtime_paths,
     has_configured_api_key,
     load_settings,
+    normalize_whisper_language,
     run_pipeline,
     sanitize_filename,
-    save_api_key,
+    save_settings,
 )
 
 
@@ -99,13 +101,16 @@ class TranscriptionApp:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
         self.status_var = tk.StringVar(
-            value="Configure a chave da API e selecione um ou mais videos ou audios."
+            value="Escolha o provedor de transcricao, configure o ambiente e selecione um ou mais videos ou audios."
         )
         self.api_status_var = tk.StringVar()
         self.api_key_var = tk.StringVar()
+        self.provider_var = tk.StringVar()
+        self.whisper_model_var = tk.StringVar()
+        self.whisper_language_var = tk.StringVar()
 
         self._build_ui()
-        self.load_api_key()
+        self.load_form_settings()
         self.refresh_file_list()
         self.poll_log_queue()
 
@@ -138,21 +143,61 @@ class TranscriptionApp:
             justify="left",
         ).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
-        config_frame = ttk.Labelframe(main_frame, text="Configuracao da API", padding=12)
+        config_frame = ttk.Labelframe(main_frame, text="Configuracao da transcricao", padding=12)
         config_frame.grid(row=1, column=0, sticky="ew", pady=(0, 12))
         config_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(config_frame, text="GEMINI_API_KEY").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(config_frame, text="Provedor").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        provider_frame = ttk.Frame(config_frame)
+        provider_frame.grid(row=0, column=1, sticky="w")
+
+        self.gemini_radio = ttk.Radiobutton(
+            provider_frame,
+            text="Gemini API",
+            value="gemini",
+            variable=self.provider_var,
+            command=self.update_configuration_status,
+        )
+        self.gemini_radio.grid(row=0, column=0, padx=(0, 12))
+
+        self.whisper_radio = ttk.Radiobutton(
+            provider_frame,
+            text="Whisper local",
+            value="whisper_local",
+            variable=self.provider_var,
+            command=self.update_configuration_status,
+        )
+        self.whisper_radio.grid(row=0, column=1)
+
+        ttk.Label(config_frame, text="GEMINI_API_KEY").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
 
         self.api_key_entry = ttk.Entry(config_frame, textvariable=self.api_key_var, show="*")
-        self.api_key_entry.grid(row=0, column=1, sticky="ew")
+        self.api_key_entry.grid(row=1, column=1, sticky="ew", pady=(10, 0))
 
         self.save_api_button = ttk.Button(
             config_frame,
-            text="Salvar no .env",
-            command=self.save_api_key_from_form,
+            text="Salvar configuracoes",
+            command=self.save_configuration_from_form,
         )
-        self.save_api_button.grid(row=0, column=2, padx=(8, 0))
+        self.save_api_button.grid(row=0, column=2, rowspan=3, padx=(8, 0), sticky="ns")
+
+        whisper_frame = ttk.Frame(config_frame)
+        whisper_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        whisper_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(whisper_frame, text="WHISPER_MODEL").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.whisper_model_combo = ttk.Combobox(
+            whisper_frame,
+            textvariable=self.whisper_model_var,
+            values=WHISPER_MODELS,
+            state="readonly",
+            width=14,
+        )
+        self.whisper_model_combo.grid(row=0, column=1, sticky="w")
+
+        ttk.Label(whisper_frame, text="WHISPER_LANGUAGE").grid(row=0, column=2, sticky="w", padx=(20, 8))
+        self.whisper_language_entry = ttk.Entry(whisper_frame, textvariable=self.whisper_language_var, width=18)
+        self.whisper_language_entry.grid(row=0, column=3, sticky="w")
 
         ttk.Label(
             config_frame,
@@ -160,7 +205,7 @@ class TranscriptionApp:
             foreground="#1f4d78",
             wraplength=900,
             justify="left",
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
         actions = ttk.Frame(main_frame)
         actions.grid(row=2, column=0, sticky="ew", pady=(0, 12))
@@ -238,36 +283,59 @@ class TranscriptionApp:
 
         content.add(logs_frame, weight=3)
 
-    def load_api_key(self):
+    def load_form_settings(self):
         settings = load_settings(ENV_FILE)
+        self.provider_var.set(settings.transcription_provider)
         self.api_key_var.set(settings.api_key)
-        self.update_api_status()
+        self.whisper_model_var.set(settings.whisper_model)
+        self.whisper_language_var.set(settings.whisper_language)
+        self.update_configuration_status()
 
-    def update_api_status(self):
+    def update_configuration_status(self):
+        provider = self.provider_var.get().strip() or "gemini"
         api_key = self.api_key_var.get().strip()
         env_location = str(ENV_FILE)
-        if has_configured_api_key(api_key):
+        if provider == "gemini" and has_configured_api_key(api_key):
             self.api_status_var.set(
-                f"Chave configurada ({mask_api_key(api_key)}). Arquivo: {env_location}"
+                f"Provedor: Gemini API. Chave configurada ({mask_api_key(api_key)}). Arquivo: {env_location}"
+            )
+        elif provider == "gemini":
+            self.api_status_var.set(
+                f"Provedor: Gemini API. Chave nao configurada. Salve a GEMINI_API_KEY no arquivo: {env_location}"
             )
         else:
             self.api_status_var.set(
-                f"Chave nao configurada. Salve a GEMINI_API_KEY no arquivo: {env_location}"
+                "Provedor: Whisper local. A transcricao roda sem API externa. "
+                f"Modelo: {self.whisper_model_var.get() or 'base'}. "
+                f"Idioma: {self.whisper_language_var.get().strip() or 'auto'}. Arquivo: {env_location}"
             )
 
-    def save_api_key_from_form(self):
+    def save_configuration_from_form(self):
+        provider = self.provider_var.get().strip() or "gemini"
         api_key = self.api_key_var.get().strip()
-        if not has_configured_api_key(api_key):
+        whisper_model = self.whisper_model_var.get().strip() or "base"
+        whisper_language = normalize_whisper_language(self.whisper_language_var.get())
+        self.whisper_language_var.set(whisper_language)
+
+        if provider == "gemini" and not has_configured_api_key(api_key):
             messagebox.showwarning(
                 "Chave obrigatoria",
                 "Informe uma GEMINI_API_KEY valida antes de salvar.",
             )
             return
 
-        save_api_key(api_key, ENV_FILE)
-        self.update_api_status()
-        self.log(f"GEMINI_API_KEY salva em {ENV_FILE}")
-        self.status_var.set("Chave da API salva com sucesso.")
+        save_settings(
+            {
+                "TRANSCRIPTION_PROVIDER": provider,
+                "GEMINI_API_KEY": api_key,
+                "WHISPER_MODEL": whisper_model,
+                "WHISPER_LANGUAGE": whisper_language,
+            },
+            ENV_FILE,
+        )
+        self.update_configuration_status()
+        self.log(f"Configuracoes salvas em {ENV_FILE}")
+        self.status_var.set("Configuracoes salvas com sucesso.")
 
     def log(self, message):
         self.logs_text.configure(state="normal")
@@ -371,21 +439,38 @@ class TranscriptionApp:
         self.start_button.configure(state=state)
         self.save_api_button.configure(state=state)
         self.api_key_entry.configure(state=state)
+        self.gemini_radio.configure(state=state)
+        self.whisper_radio.configure(state=state)
+        self.whisper_model_combo.configure(state="disabled" if running else "readonly")
+        self.whisper_language_entry.configure(state=state)
 
         if running:
             self.status_var.set("Processamento em andamento. Acompanhe os logs abaixo.")
 
     def start_transcription(self):
+        provider = self.provider_var.get().strip() or "gemini"
         api_key = self.api_key_var.get().strip()
-        if not has_configured_api_key(api_key):
+        whisper_model = self.whisper_model_var.get().strip() or "base"
+        whisper_language = normalize_whisper_language(self.whisper_language_var.get())
+        self.whisper_language_var.set(whisper_language)
+
+        if provider == "gemini" and not has_configured_api_key(api_key):
             messagebox.showwarning(
                 "Chave obrigatoria",
                 "Configure uma GEMINI_API_KEY valida antes de iniciar a transcricao.",
             )
             return
 
-        save_api_key(api_key, ENV_FILE)
-        self.update_api_status()
+        save_settings(
+            {
+                "TRANSCRIPTION_PROVIDER": provider,
+                "GEMINI_API_KEY": api_key,
+                "WHISPER_MODEL": whisper_model,
+                "WHISPER_LANGUAGE": whisper_language,
+            },
+            ENV_FILE,
+        )
+        self.update_configuration_status()
 
         files = [
             path
@@ -405,6 +490,7 @@ class TranscriptionApp:
         self.last_output_file = None
         self.log("")
         self.log("========== NOVA EXECUCAO ==========")
+        self.log(f"Provedor selecionado: {provider}")
         self.log(f"Arquivos na fila: {len(files)}")
         self.set_running_state(True)
 

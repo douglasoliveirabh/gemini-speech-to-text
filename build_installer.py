@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import importlib.util
 import shutil
 import subprocess
 import sys
@@ -63,6 +64,17 @@ def build_with_pyinstaller():
         "python-docx",
         "interface_desktop.py",
     ]
+
+    if importlib.util.find_spec("whisper") is not None:
+        command.extend(
+            [
+                "--collect-all",
+                "whisper",
+                "--copy-metadata",
+                "openai-whisper",
+            ]
+        )
+
     run_command(command)
 
 
